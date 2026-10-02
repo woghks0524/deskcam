@@ -4,6 +4,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import {
   Camera,
   ChevronLeft,
+  Circle,
   ChevronRight,
   Copy,
   Download,
@@ -26,6 +27,7 @@ import {
   Trash2,
   Type,
   Undo2,
+  Video,
   X,
   ZoomIn,
   ZoomOut,
@@ -41,11 +43,22 @@ import {
   type SavedCamera,
 } from "@/lib/camera";
 import { TEXT_FONT, renderAnnotations, type Pt, type Stroke } from "@/lib/annotations";
-import { clearCaptures, deleteCapture, loadCaptures, saveCapture } from "@/lib/captureStore";
+import {
+  clearCaptures,
+  deleteCapture,
+  deleteRecording,
+  loadCaptures,
+  loadRecordings,
+  saveCapture,
+  saveRecording,
+  type StoredRecording,
+} from "@/lib/captureStore";
+import { RecordBadge, RecordPanel, formatDuration, useRecorder, type NewRecording } from "@/components/Recorder";
 import { SHORTCUT_GROUPS } from "@/lib/shortcuts";
 
 type Tool = "move" | "pen" | "highlighter" | "eraser" | "text";
 type Capture = { id: string; createdAt: number; blob: Blob; url: string };
+type Recording = StoredRecording & { url: string };
 type View = { zoom: number; pan: { x: number; y: number } };
 type Hist = { cur: Stroke[]; past: Stroke[][]; future: Stroke[][] };
 type Gesture =
@@ -84,10 +97,10 @@ function readSavedCam(): SavedCamera | null {
   }
 }
 
-function fileName(t: number, ext: string) {
+function fileName(t: number, ext: string, prefix = "실물화상기") {
   const d = new Date(t);
   const p = (n: number) => String(n).padStart(2, "0");
-  return `실물화상기_${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}.${ext}`;
+  return `${prefix}_${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}-${p(d.getMinutes())}-${p(d.getSeconds())}.${ext}`;
 }
 function downloadBlob(blob: Blob, name: string) {
   const a = document.createElement("a");
@@ -143,6 +156,10 @@ export default function DocCam() {
   const [hist, setHist] = useState<Hist>({ cur: [], past: [], future: [] });
   const [captures, setCaptures] = useState<Capture[]>([]);
   const [galleryOpen, setGalleryOpen] = useState(false);
+  const [galleryTab, setGalleryTab] = useState<"photo" | "video">("photo");
+  const [recordings, setRecordings] = useState<Recording[]>([]);
+  const [playing, setPlaying] = useState<string | null>(null);
+  const playerRef = useRef<HTMLVideoElement>(null);
   const [viewing, setViewing] = useState<string | null>(null);
   const [helpOpen, setHelpOpen] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -173,11 +190,13 @@ export default function DocCam() {
   const L = useRef({
     vp, vsize, view, S, angle, m, mirror, rot, tool, color, penSize, strokes: hist.cur, cams, camId, quality,
     frozen, captures, viewing, helpOpen, settingsOpen, galleryOpen, captureAnno, filterCss, bright, textDraft,
+    recordings, playing,
   });
   useLayoutEffect(() => {
     L.current = {
       vp, vsize, view, S, angle, m, mirror, rot, tool, color, penSize, strokes: hist.cur, cams, camId, quality,
       frozen, captures, viewing, helpOpen, settingsOpen, galleryOpen, captureAnno, filterCss, bright, textDraft,
+    recordings, playing,
     };
   });
 
@@ -275,6 +294,12 @@ export default function DocCam() {
       setCaptures((prev) => [
         ...prev,
         ...list.filter((c) => !prev.some((p) => p.id === c.id)).map((c) => ({ ...c, url: URL.createObjectURL(c.blob) })),
+      ]),
+    );
+    loadRecordings().then((list) =>
+      setRecordings((prev) => [
+        ...prev,
+        ...list.filter((r) => !prev.some((p) => p.id === r.id)).map((r) => ({ ...r, url: URL.createObjectURL(r.blob) })),
       ]),
     );
     return () => {
@@ -603,6 +628,67 @@ export default function DocCam() {
     removeCapture(captures[i].id);
   }, [removeCapture]);
 
+  // ---- 녹화 ----
+  // 실물화상기 녹화: 지금 화면(확대·회전·판서 포함)을 녹화용 캔버스에 그대로 그린다
+  const paintView = useCallback((ctx: CanvasRenderingContext2D, cw: number, ch: number) => {
+    const { vp, view, S, angle, m, vsize, filterCss } = L.current;
+    const v = videoRef.current;
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = "#000";
+    ctx.fillRect(0, 0, cw, ch);
+    if (!v || !v.videoWidth || !streamRef.current || !vp.w || !vp.h) return;
+    const k = Math.min(cw / vp.w, ch / vp.h);
+    ctx.translate((cw - vp.w * k) / 2, (ch - vp.h * k) / 2);
+    ctx.scale(k, k);
+    ctx.translate(vp.w / 2 + view.pan.x, vp.h / 2 + view.pan.y);
+    ctx.scale(m, 1);
+    ctx.rotate(angle);
+    ctx.scale(S, S);
+    ctx.translate(-vsize.w / 2, -vsize.h / 2);
+    ctx.filter = filterCss;
+    ctx.drawImage(v, 0, 0, vsize.w, vsize.h);
+    ctx.filter = "none";
+    if (annoRef.current) ctx.drawImage(annoRef.current, 0, 0, vsize.w, vsize.h);
+  }, []);
+
+  // 녹화 해상도: 화면 비율 그대로, 최대 1920×1080 (짝수로 맞춰야 인코더가 받는다)
+  const getRecordSize = useCallback(() => {
+    const { vp } = L.current;
+    const w = vp.w || 1280;
+    const h = vp.h || 720;
+    const k = Math.min(1920 / w, 1080 / h, window.devicePixelRatio || 1);
+    const even = (n: number) => Math.max(2, Math.round(n / 2) * 2);
+    return { width: even(w * k), height: even(h * k) };
+  }, []);
+
+  const onRecorded = useCallback(
+    (r: NewRecording) => {
+      const rec: Recording = { ...r, id: newId(), url: URL.createObjectURL(r.blob) };
+      setRecordings((p) => [rec, ...p]);
+      saveRecording({ id: rec.id, createdAt: rec.createdAt, blob: rec.blob, ext: rec.ext, durationMs: rec.durationMs });
+      setPlaying(rec.id);
+      notify(`녹화를 저장했어요 (${formatDuration(r.durationMs)}) · 저장 버튼으로 파일 받기`);
+    },
+    [notify],
+  );
+
+  const recorder = useRecorder({ paint: paintView, getCameraSize: getRecordSize, notify, onSaved: onRecorded });
+
+  const downloadRecording = useCallback(
+    (r: Recording) => downloadBlob(r.blob, fileName(r.createdAt, r.ext, "녹화")),
+    [],
+  );
+  const removeRecording = useCallback((id: string) => {
+    if (!confirm("이 녹화 영상을 지울까요? 되돌릴 수 없어요.")) return;
+    setRecordings((p) => {
+      const target = p.find((r) => r.id === id);
+      if (target) URL.revokeObjectURL(target.url);
+      return p.filter((r) => r.id !== id);
+    });
+    setPlaying((cur) => (cur === id ? null : cur));
+    deleteRecording(id);
+  }, []);
+
   const pickTool = useCallback((t: Tool) => {
     setTool(t);
     setTextDraft(null);
@@ -612,11 +698,13 @@ export default function DocCam() {
   const actions = useRef({
     toggleFreeze, toggleFullscreen, rotate, toggleMirror, nextCam, zoomAt, resetView, panBy, changeBright, capture,
     copyView, saveLast, undo, redo, clearAnno, pickTool, moveViewing, deleteViewing, downloadCapture, copyCapture,
+    recorder, downloadRecording, removeRecording,
   });
   useLayoutEffect(() => {
     actions.current = {
       toggleFreeze, toggleFullscreen, rotate, toggleMirror, nextCam, zoomAt, resetView, panBy, changeBright, capture,
       copyView, saveLast, undo, redo, clearAnno, pickTool, moveViewing, deleteViewing, downloadCapture, copyCapture,
+    recorder, downloadRecording, removeRecording,
     };
   });
 
@@ -628,6 +716,20 @@ export default function DocCam() {
       const l = L.current;
       const mod = e.metaKey || e.ctrlKey;
       const code = e.code;
+
+      if (l.playing) {
+        const r = l.recordings.find((x) => x.id === l.playing);
+        const pv = playerRef.current;
+        if (code === "Escape") setPlaying(null);
+        else if (code === "Space" && pv) {
+          if (pv.paused) pv.play().catch(() => {});
+          else pv.pause();
+        } else if ((code === "Delete" || code === "Backspace") && r) a.removeRecording(r.id);
+        else if (mod && code === "KeyS" && r) a.downloadRecording(r);
+        else return;
+        e.preventDefault();
+        return;
+      }
 
       if (l.viewing) {
         const cap = l.captures.find((c) => c.id === l.viewing);
@@ -671,6 +773,13 @@ export default function DocCam() {
         case "BracketRight": a.changeBright(0.1); break;
         case "KeyS": case "KeyC": a.capture(e.shiftKey ? "full" : "view"); break;
         case "KeyG": setGalleryOpen((g) => !g); break;
+        case "KeyO":
+          if (a.recorder.rec) a.recorder.stop();
+          else {
+            setSettingsOpen(false);
+            a.recorder.setPanelOpen((o) => !o);
+          }
+          break;
         case "KeyV": a.pickTool("move"); break;
         case "KeyP": a.pickTool("pen"); break;
         case "KeyH": a.pickTool("highlighter"); break;
@@ -681,6 +790,7 @@ export default function DocCam() {
         case "Escape":
           if (l.helpOpen) setHelpOpen(false);
           else if (l.settingsOpen) setSettingsOpen(false);
+          else if (a.recorder.panelOpen) a.recorder.setPanelOpen(false);
           else a.pickTool("move");
           break;
         default: {
@@ -821,7 +931,7 @@ export default function DocCam() {
   const scheduleHide = useCallback(() => {
     clearTimeout(hideTimer.current);
     hideTimer.current = window.setTimeout(() => {
-      if (!barHover.current && !L.current.settingsOpen) setUiVisible(false);
+      if (!barHover.current && !L.current.settingsOpen && !actions.current.recorder.panelOpen) setUiVisible(false);
     }, 3000);
   }, []);
   const wake = useCallback(() => {
@@ -833,9 +943,10 @@ export default function DocCam() {
     return () => clearTimeout(hideTimer.current);
   }, [scheduleHide]);
 
-  const showUi = uiVisible || status !== "live" || settingsOpen || helpOpen;
+  const showUi = uiVisible || status !== "live" || settingsOpen || helpOpen || recorder.panelOpen;
   const viewingIdx = captures.findIndex((c) => c.id === viewing);
   const viewingCap = viewingIdx >= 0 ? captures[viewingIdx] : null;
+  const playingRec = recordings.find((r) => r.id === playing) ?? null;
   const curCam = cams.find((c) => c.deviceId === camId);
   const cursor =
     tool === "move"
@@ -979,6 +1090,8 @@ export default function DocCam() {
           </div>
         )}
 
+        <RecordBadge r={recorder} />
+
         {/* 도구막대 */}
         <div
           className={`absolute inset-x-0 bottom-4 z-20 flex justify-center px-3 transition-opacity duration-300 ${
@@ -1032,7 +1145,7 @@ export default function DocCam() {
                     title={`${COLOR_NAMES[i]} (${i + 1})`}
                     onPointerDown={(e) => e.preventDefault()}
                     onClick={() => setColor(c)}
-                    className={`h-6 w-6 rounded-full ring-2 ${color === c ? "ring-white" : "ring-white/15"}`}
+                    className={`h-5 w-5 rounded-full ring-2 ${color === c ? "ring-white" : "ring-white/15"}`}
                     style={{ background: c }}
                   />
                 ))}
@@ -1043,7 +1156,7 @@ export default function DocCam() {
                       title={{ s: "가늘게", m: "보통", l: "굵게" }[s]}
                       onPointerDown={(e) => e.preventDefault()}
                       onClick={() => setPenSize(s)}
-                      className={`grid h-8 w-8 place-items-center rounded-lg ${penSize === s ? "bg-white/20" : "hover:bg-white/10"}`}
+                      className={`grid h-7 w-7 place-items-center rounded-lg ${penSize === s ? "bg-white/20" : "hover:bg-white/10"}`}
                     >
                       <span className="rounded-full bg-white" style={{ width: PEN_PX[s] + 2, height: PEN_PX[s] + 2 }} />
                     </button>
@@ -1094,6 +1207,23 @@ export default function DocCam() {
             >
               <Camera size={20} /> 캡처
             </button>
+            {recorder.rec ? (
+              <Btn label="녹화 끝내기" keys="O" onClick={recorder.stop}>
+                <span className="h-4 w-4 animate-pulse rounded-sm bg-red-500" />
+              </Btn>
+            ) : (
+              <Btn
+                label="화면 녹화"
+                keys="O"
+                active={recorder.panelOpen}
+                onClick={() => {
+                  setSettingsOpen(false);
+                  recorder.setPanelOpen((o) => !o);
+                }}
+              >
+                <Circle size={18} className="text-red-500" fill="currentColor" />
+              </Btn>
+            )}
             <Btn label="캡처 목록" keys="G" active={galleryOpen} onClick={() => setGalleryOpen((g) => !g)}>
               <span className="relative">
                 <Images size={20} />
@@ -1109,13 +1239,17 @@ export default function DocCam() {
             <Btn label={fullscreen ? "전체 화면 끝내기" : "전체 화면"} keys="F" onClick={toggleFullscreen}>
               {fullscreen ? <Minimize size={20} /> : <Maximize size={20} />}
             </Btn>
-            <Btn label="설정" keys="" active={settingsOpen} onClick={() => setSettingsOpen((s) => !s)}>
+            <Btn label="설정" keys="" active={settingsOpen} onClick={() => {
+                recorder.setPanelOpen(false);
+                setSettingsOpen((s) => !s);
+              }}>
               <SlidersHorizontal size={20} />
             </Btn>
             <Btn label="단축키" keys="?" onClick={() => setHelpOpen(true)}>
               <Keyboard size={20} />
             </Btn>
 
+            {recorder.panelOpen && <RecordPanel r={recorder} />}
             {settingsOpen && (
               <div className="absolute bottom-full right-0 mb-2 w-72 rounded-2xl bg-neutral-900 p-4 text-sm shadow-2xl ring-1 ring-white/10">
                 <div className="mb-3 flex items-center justify-between">
@@ -1174,10 +1308,20 @@ export default function DocCam() {
       {/* 캡처 목록 */}
       {galleryOpen && (
         <aside className="flex w-64 shrink-0 flex-col border-l border-white/10 bg-neutral-900">
-          <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
-            <span className="font-bold">캡처 {captures.length}장</span>
+          <div className="flex items-center justify-between border-b border-white/10 px-3 py-2.5">
+            <div className="flex rounded-lg bg-white/5 p-0.5 text-sm">
+              {(["photo", "video"] as const).map((t) => (
+                <button
+                  key={t}
+                  onClick={() => setGalleryTab(t)}
+                  className={`rounded-md px-3 py-1 ${galleryTab === t ? "bg-white/15 font-bold" : "text-white/60 hover:text-white"}`}
+                >
+                  {t === "photo" ? `사진 ${captures.length}` : `영상 ${recordings.length}`}
+                </button>
+              ))}
+            </div>
             <div className="flex items-center gap-1">
-              {captures.length > 0 && (
+              {galleryTab === "photo" && captures.length > 0 && (
                 <button onClick={removeAllCaptures} className="rounded-lg px-2 py-1 text-xs text-white/60 hover:bg-white/10 hover:text-white">
                   모두 지우기
                 </button>
@@ -1188,37 +1332,102 @@ export default function DocCam() {
             </div>
           </div>
           <div className="flex-1 space-y-3 overflow-y-auto p-3">
-            {captures.length === 0 && (
+            {galleryTab === "photo" && captures.length === 0 && (
               <p className="px-1 py-6 text-center text-sm leading-relaxed text-white/50">
                 아직 캡처가 없어요.
                 <br />
                 <kbd className="rounded bg-white/10 px-1.5">S</kbd> 를 누르면 지금 화면이 여기에 쌓여요.
               </p>
             )}
-            {captures.map((c, i) => (
-              <div key={c.id} className="group relative overflow-hidden rounded-lg bg-black ring-1 ring-white/10">
-                {/* eslint-disable-next-line @next/next/no-img-element */}
-                <img src={c.url} alt={`캡처 ${captures.length - i}`} className="aspect-video w-full cursor-zoom-in object-contain" onClick={() => setViewing(c.id)} />
-                <div className="flex items-center justify-between px-2 py-1 text-xs text-white/60">
-                  <span>
-                    #{captures.length - i} · {new Date(c.createdAt).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" })}
-                  </span>
-                  <span className="flex gap-0.5 opacity-70 group-hover:opacity-100">
-                    <MiniBtn title="저장" onClick={() => downloadCapture(c)}>
-                      <Download size={14} />
-                    </MiniBtn>
-                    <MiniBtn title="복사" onClick={() => copyCapture(c)}>
-                      <Copy size={14} />
-                    </MiniBtn>
-                    <MiniBtn title="삭제" onClick={() => removeCapture(c.id)}>
-                      <Trash2 size={14} />
-                    </MiniBtn>
-                  </span>
+            {galleryTab === "photo" &&
+              captures.map((c, i) => (
+                <div key={c.id} className="group relative overflow-hidden rounded-lg bg-black ring-1 ring-white/10">
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img src={c.url} alt={`캡처 ${captures.length - i}`} className="aspect-video w-full cursor-zoom-in object-contain" onClick={() => setViewing(c.id)} />
+                  <div className="flex items-center justify-between px-2 py-1 text-xs text-white/60">
+                    <span>
+                      #{captures.length - i} · {new Date(c.createdAt).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" })}
+                    </span>
+                    <span className="flex gap-0.5 opacity-70 group-hover:opacity-100">
+                      <MiniBtn title="저장" onClick={() => downloadCapture(c)}>
+                        <Download size={14} />
+                      </MiniBtn>
+                      <MiniBtn title="복사" onClick={() => copyCapture(c)}>
+                        <Copy size={14} />
+                      </MiniBtn>
+                      <MiniBtn title="삭제" onClick={() => removeCapture(c.id)}>
+                        <Trash2 size={14} />
+                      </MiniBtn>
+                    </span>
+                  </div>
                 </div>
-              </div>
-            ))}
+              ))}
+            {galleryTab === "video" && recordings.length === 0 && (
+              <p className="px-1 py-6 text-center text-sm leading-relaxed text-white/50">
+                아직 녹화한 영상이 없어요.
+                <br />
+                <kbd className="rounded bg-white/10 px-1.5">O</kbd> 를 누르면 녹화를 시작할 수 있어요.
+              </p>
+            )}
+            {galleryTab === "video" &&
+              recordings.map((r) => (
+                <div key={r.id} className="group relative overflow-hidden rounded-lg bg-black ring-1 ring-white/10">
+                  <button className="relative block w-full" onClick={() => setPlaying(r.id)}>
+                    <video src={`${r.url}#t=0.5`} preload="metadata" muted className="pointer-events-none aspect-video w-full object-contain" />
+                    <span className="absolute bottom-1 right-1 rounded bg-black/75 px-1.5 text-xs tabular-nums">{formatDuration(r.durationMs)}</span>
+                    <span className="absolute inset-0 grid place-items-center opacity-0 transition group-hover:opacity-100">
+                      <Play size={32} className="drop-shadow" fill="currentColor" />
+                    </span>
+                  </button>
+                  <div className="flex items-center justify-between px-2 py-1 text-xs text-white/60">
+                    <span>
+                      {new Date(r.createdAt).toLocaleTimeString("ko-KR", { hour: "2-digit", minute: "2-digit" })} · {(r.blob.size / 1048576).toFixed(1)}MB
+                    </span>
+                    <span className="flex gap-0.5 opacity-70 group-hover:opacity-100">
+                      <MiniBtn title="저장" onClick={() => downloadRecording(r)}>
+                        <Download size={14} />
+                      </MiniBtn>
+                      <MiniBtn title="삭제" onClick={() => removeRecording(r.id)}>
+                        <Trash2 size={14} />
+                      </MiniBtn>
+                    </span>
+                  </div>
+                </div>
+              ))}
           </div>
         </aside>
+      )}
+
+      {/* 녹화 영상 보기 */}
+      {playingRec && (
+        <div className="fixed inset-0 z-40 flex flex-col bg-black/95" onClick={() => setPlaying(null)}>
+          <div className="flex items-center justify-between px-5 py-3" onClick={(e) => e.stopPropagation()}>
+            <span className="flex items-center gap-2 text-white/70">
+              <Video size={18} />
+              녹화 · {new Date(playingRec.createdAt).toLocaleTimeString("ko-KR")} · {formatDuration(playingRec.durationMs)} ·{" "}
+              {(playingRec.blob.size / 1048576).toFixed(1)}MB
+              <span className="ml-2 text-xs text-white/40">Space 재생/멈춤 · Esc 닫기</span>
+            </span>
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => downloadRecording(playingRec)}
+                className="flex items-center gap-1.5 rounded-xl bg-sky-500 px-3.5 py-2 font-semibold hover:bg-sky-400"
+                title="파일로 저장 (Ctrl+S)"
+              >
+                <Download size={18} /> 저장 (.{playingRec.ext})
+              </button>
+              <Btn label="삭제" keys="Delete" onClick={() => removeRecording(playingRec.id)}>
+                <Trash2 size={20} />
+              </Btn>
+              <Btn label="닫기" keys="Esc" onClick={() => setPlaying(null)}>
+                <X size={20} />
+              </Btn>
+            </div>
+          </div>
+          <div className="flex min-h-0 flex-1 items-center justify-center p-4" onClick={(e) => e.stopPropagation()}>
+            <video ref={playerRef} key={playingRec.id} src={playingRec.url} controls autoPlay className="max-h-full max-w-full" />
+          </div>
+        </div>
       )}
 
       {/* 캡처 크게 보기 */}
@@ -1336,7 +1545,7 @@ function Btn({
         e.stopPropagation();
         onClick();
       }}
-      className={`grid h-10 w-10 place-items-center rounded-xl transition-colors disabled:opacity-30 ${
+      className={`grid h-9 w-9 place-items-center rounded-xl transition-colors disabled:opacity-30 ${
         active ? "bg-white text-neutral-900" : "hover:bg-white/10"
       }`}
     >

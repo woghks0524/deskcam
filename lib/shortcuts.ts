@@ -27,6 +27,14 @@ export const SHORTCUT_GROUPS: { title: string; items: [string, string][] }[] = [
     ],
   },
   {
+    title: "녹화",
+    items: [
+      ["O", "녹화 창 열기 / 녹화 끝내기"],
+      ["Space (영상 볼 때)", "재생 / 멈춤"],
+      ["Ctrl+S (영상 볼 때)", "영상 파일로 저장"],
+    ],
+  },
+  {
     title: "판서 · 메모",
     items: [
       ["V", "이동 (손)"],
