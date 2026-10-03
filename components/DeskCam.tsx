@@ -72,8 +72,8 @@ const PEN_PX = { s: 3, m: 6, l: 12 } as const; // 화면 기준 굵기
 const TEXT_PX = 32;
 const MIN_ZOOM = 0.5;
 const MAX_ZOOM = 12;
-const LS_CAM = "doccam.camera";
-const LS_QUALITY = "doccam.quality";
+const LS_CAM = "deskcam.camera";
+const LS_QUALITY = "deskcam.quality";
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
@@ -129,7 +129,7 @@ function newId() {
 }
 const stopStream = (s: MediaStream | null) => s?.getTracks().forEach((t) => t.stop());
 
-export default function DocCam() {
+export default function DeskCam() {
   const rootRef = useRef<HTMLDivElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);

@@ -4,8 +4,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Camera, Circle, Monitor, Pause, Play, Square, X } from "lucide-react";
 import { canRecordScreen, pickMime, startRecording, type RecOptions, type RecSession, type RecSource } from "@/lib/recorder";
 
-const LS_MIC = "doccam.mic";
-const LS_SYS = "doccam.systemAudio";
+const LS_MIC = "deskcam.mic";
+const LS_SYS = "deskcam.systemAudio";
 
 export type NewRecording = { createdAt: number; blob: Blob; ext: string; durationMs: number };
 

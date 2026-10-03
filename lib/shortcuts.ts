@@ -1,4 +1,4 @@
-// 도움말 화면에 보여줄 단축키 목록. 실제 처리는 components/DocCam.tsx의 onKeyDown.
+// 도움말 화면에 보여줄 단축키 목록. 실제 처리는 components/DeskCam.tsx의 onKeyDown.
 // 한글 입력 상태에서도 동작하도록 키 이름이 아니라 자판 위치(e.code)로 처리한다.
 
 export const SHORTCUT_GROUPS: { title: string; items: [string, string][] }[] = [

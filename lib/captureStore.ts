@@ -4,7 +4,7 @@
 export type StoredCapture = { id: string; createdAt: number; blob: Blob };
 export type StoredRecording = { id: string; createdAt: number; blob: Blob; ext: string; durationMs: number };
 
-const DB_NAME = "doccam";
+const DB_NAME = "deskcam";
 const CAPTURES = "captures";
 const RECORDINGS = "recordings";
 
