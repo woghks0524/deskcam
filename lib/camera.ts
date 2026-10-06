@@ -98,12 +98,16 @@ export function setAutoFocus(track: MediaStreamTrack) {
   return applyFocus(track, { focusMode: "continuous" });
 }
 
-// 지금 화면에 초점을 한 번 다시 맞춘다
+// 지금 화면에 초점을 한 번 맞추고 그 자리에 고정한다.
+// 계속 자동으로 두면 손이 화면에 들어올 때마다 초점이 왔다 갔다 해서 보기 힘들다.
 export async function refocus(track: MediaStreamTrack, caps: FocusCaps) {
   if (caps.once) return applyFocus(track, { focusMode: "single-shot" });
-  // 한 번 맞추기가 없으면 자동 초점을 껐다 켜서 다시 잡게 한다
   await applyFocus(track, { focusMode: "manual" }).catch(() => {});
-  return applyFocus(track, { focusMode: "continuous" });
+  await applyFocus(track, { focusMode: "continuous" });
+  await new Promise((r) => setTimeout(r, 1500));
+  if (track.readyState !== "live") return;
+  // 거리 없이 manual로만 바꾸면 렌즈가 지금 위치에 멈춘다
+  return applyFocus(track, { focusMode: "manual" });
 }
 
 export function setFocusDistance(track: MediaStreamTrack, distance: number) {
