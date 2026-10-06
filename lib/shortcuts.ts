@@ -14,7 +14,7 @@ export const SHORTCUT_GROUPS: { title: string; items: [string, string][] }[] = [
       ["방향키", "확대한 화면 이동"],
       ["[ / ]", "어둡게 / 밝게"],
       ["N", "다음 카메라로 바꾸기"],
-      ["A", "초점 다시 맞추기"],
+      ["A", "초점 맞추고 고정"],
     ],
   },
   {

@@ -235,8 +235,17 @@ export default function DeskCam() {
     const fc = getFocusCaps(track);
     setFocusCaps(fc);
     const fs = st as MediaTrackSettings & { focusMode?: string; focusDistance?: number };
-    setFocusAuto(fs.focusMode !== "manual");
+    setFocusAuto(false);
     setFocusDist(fs.focusDistance ?? fc?.range?.min ?? 0);
+    // 켜자마자 초점을 한 번 맞추고 고정
+    if (track && fc && (fc.auto || fc.once)) {
+      refocus(track, fc)
+        .then(() => {
+          const d = (track.getSettings() as { focusDistance?: number }).focusDistance;
+          if (d !== undefined) setFocusDist(d);
+        })
+        .catch(() => {});
+    }
     track?.addEventListener("ended", () => {
       if (streamRef.current !== stream) return;
       setStatus("error");
@@ -549,10 +558,13 @@ export default function DeskCam() {
     const track = streamRef.current?.getVideoTracks()[0];
     const caps = track && getFocusCaps(track);
     if (!track || !caps || (!caps.auto && !caps.once)) return notify("이 카메라는 웹에서 초점을 맞출 수 없어요");
+    notify("초점 맞추는 중…");
     refocus(track, caps)
       .then(() => {
-        setFocusAuto(true);
-        notify("초점을 다시 맞췄어요");
+        setFocusAuto(false);
+        const d = (track.getSettings() as { focusDistance?: number }).focusDistance;
+        if (d !== undefined) setFocusDist(d);
+        notify("초점을 맞추고 고정했어요");
       })
       .catch(() => notify("초점을 맞추지 못했어요"));
   }, [notify]);
@@ -560,7 +572,10 @@ export default function DeskCam() {
     (on: boolean) => {
       const track = streamRef.current?.getVideoTracks()[0];
       if (!track) return;
-      const p = on ? setAutoFocus(track) : setFocusDistance(track, L.current.focusDist);
+      // 끌 때는 렌즈를 지금 위치에 멈춘다
+      const p = on
+        ? setAutoFocus(track)
+        : track.applyConstraints({ advanced: [{ focusMode: "manual" } as MediaTrackConstraintSet] });
       p.then(() => setFocusAuto(on)).catch(() => notify("초점 설정을 바꾸지 못했어요"));
     },
     [notify],
@@ -1376,7 +1391,7 @@ export default function DeskCam() {
                       {focusCaps.auto && (
                         <label className="flex cursor-pointer items-center gap-1.5 text-white/80">
                           <input type="checkbox" checked={focusAuto} onChange={(e) => changeFocusAuto(e.target.checked)} />
-                          자동
+                          계속 자동
                         </label>
                       )}
                     </div>
