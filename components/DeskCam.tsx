@@ -37,7 +37,13 @@ import {
   cameraErrorMessage,
   listCameras,
   openCamera,
-  pickBest,
+  openFirstWorking,
+  rankCameras,
+  getFocusCaps,
+  refocus,
+  setAutoFocus,
+  setFocusDistance,
+  type FocusCaps,
   scoreCamera,
   type Quality,
   type SavedCamera,
@@ -136,6 +142,7 @@ export default function DeskCam() {
   const annoRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const seqRef = useRef(0);
+  const connectingRef = useRef(false);
 
   const [cams, setCams] = useState<MediaDeviceInfo[]>([]);
   const [camId, setCamId] = useState("");
@@ -144,7 +151,14 @@ export default function DeskCam() {
   const [quality, setQuality] = useState<Quality>(() => (lsGet(LS_QUALITY) as Quality) || "1080");
   const [vsize, setVsize] = useState({ w: 1920, h: 1080 });
   const [vp, setVp] = useState({ w: 0, h: 0 });
-  const [view, setView] = useState<View>({ zoom: 1, pan: { x: 0, y: 0 } });
+  const [view, setViewRaw] = useState<View>({ zoom: 1, pan: { x: 0, y: 0 } });
+  // 확대·축소 애니메이션: 끌기·핀치처럼 직접 움직일 때는 바로, 버튼·휠은 부드럽게
+  const anim = useRef<{ raf: number; to: View } | null>(null);
+  const setView = useCallback((next: View | ((v: View) => View)) => {
+    if (anim.current) cancelAnimationFrame(anim.current.raf);
+    anim.current = null;
+    setViewRaw(next);
+  }, []);
   const [rot, setRot] = useState(0); // 90° 단위 0~3
   const [mirror, setMirror] = useState(false);
   const [frozen, setFrozen] = useState(false);
@@ -169,6 +183,9 @@ export default function DeskCam() {
   const [uiVisible, setUiVisible] = useState(true);
   const [fullscreen, setFullscreen] = useState(false);
   const [trackInfo, setTrackInfo] = useState("");
+  const [focusCaps, setFocusCaps] = useState<FocusCaps | null>(null);
+  const [focusAuto, setFocusAuto] = useState(true);
+  const [focusDist, setFocusDist] = useState(0);
   const [textDraft, setTextDraft] = useState<{ sx: number; sy: number; vx: number; vy: number; value: string } | null>(
     null,
   );
@@ -190,13 +207,13 @@ export default function DeskCam() {
   const L = useRef({
     vp, vsize, view, S, angle, m, mirror, rot, tool, color, penSize, strokes: hist.cur, cams, camId, quality,
     frozen, captures, viewing, helpOpen, settingsOpen, galleryOpen, captureAnno, filterCss, bright, textDraft,
-    recordings, playing,
+    recordings, playing, focusDist,
   });
   useLayoutEffect(() => {
     L.current = {
       vp, vsize, view, S, angle, m, mirror, rot, tool, color, penSize, strokes: hist.cur, cams, camId, quality,
       frozen, captures, viewing, helpOpen, settingsOpen, galleryOpen, captureAnno, filterCss, bright, textDraft,
-    recordings, playing,
+    recordings, playing, focusDist,
     };
   });
 
@@ -215,6 +232,11 @@ export default function DeskCam() {
     const st = track?.getSettings() ?? {};
     setCamId(st.deviceId ?? "");
     setTrackInfo(st.width ? `${st.width}×${st.height}${st.frameRate ? ` · ${Math.round(st.frameRate)}fps` : ""}` : "");
+    const fc = getFocusCaps(track);
+    setFocusCaps(fc);
+    const fs = st as MediaTrackSettings & { focusMode?: string; focusDistance?: number };
+    setFocusAuto(fs.focusMode !== "manual");
+    setFocusDist(fs.focusDistance ?? fc?.range?.min ?? 0);
     track?.addEventListener("ended", () => {
       if (streamRef.current !== stream) return;
       setStatus("error");
@@ -232,6 +254,7 @@ export default function DeskCam() {
   const connect = useCallback(
     async (preferId?: string) => {
       const seq = ++seqRef.current;
+      connectingRef.current = true;
       stopStream(streamRef.current);
       streamRef.current = null;
       setStatus("connecting");
@@ -247,17 +270,24 @@ export default function DeskCam() {
       try {
         let list = await listCameras();
         // 권한 전에는 이름·ID가 비어 있으므로, 일단 열고 나서 다시 고른다
-        const first = preferId ?? pickBest(list.filter((c) => c.deviceId), saved)?.deviceId;
-        stream = await openCamera(first || undefined, q);
+        const hadLabels = list.some((c) => c.label);
+        if (preferId) {
+          stream = await openCamera(preferId, q);
+        } else {
+          const order = hadLabels ? rankCameras(list, saved).map((c) => c.deviceId) : [];
+          stream = await openFirstWorking(order, q);
+        }
         if (seq !== seqRef.current) return stopStream(stream);
         list = await listCameras();
-        if (!preferId) {
-          const best = pickBest(list, saved);
+        if (!preferId && !hadLabels) {
+          // 권한을 받은 뒤 진짜 고를 카메라가 지금 것과 다르면 갈아탄다.
+          // 카메라 두 대를 동시에 켜면 USB 대역폭 때문에 실패할 수 있어 먼저 끈다.
+          const order = rankCameras(list, saved).map((c) => c.deviceId);
           const cur = stream.getVideoTracks()[0]?.getSettings().deviceId;
-          if (best?.deviceId && best.deviceId !== cur) {
+          if (order[0] && order[0] !== cur) {
             stopStream(stream);
             stream = null;
-            stream = await openCamera(best.deviceId, q);
+            stream = await openFirstWorking(order, q);
             if (seq !== seqRef.current) return stopStream(stream);
           }
         }
@@ -270,6 +300,8 @@ export default function DeskCam() {
         } catch {}
         setStatus("error");
         setError(cameraErrorMessage(err));
+      } finally {
+        if (seq === seqRef.current) connectingRef.current = false;
       }
     },
     [attach],
@@ -316,6 +348,8 @@ export default function DeskCam() {
     const onChange = () => {
       clearTimeout(t);
       t = window.setTimeout(async () => {
+        // 연결 중에 권한이 허용되면서 오는 신호는 무시 (같은 카메라를 두 번 열게 됨)
+        if (connectingRef.current) return;
         const prev = L.current.cams;
         const list = await listCameras();
         setCams(list);
@@ -440,27 +474,55 @@ export default function DeskCam() {
   }, [commitStrokes]);
 
   // ---- 보기 조작 ----
-  const zoomAt = useCallback((f: number, sx?: number, sy?: number) => {
-    setView((v) => {
+  const animateTo = useCallback(
+    (to: View) => {
+      const from = L.current.view;
+      if (anim.current) cancelAnimationFrame(anim.current.raf);
+      const start = performance.now();
+      const DUR = 200;
+      const step = (now: number) => {
+        const t = Math.min(1, (now - start) / DUR);
+        const e = 1 - (1 - t) ** 3;
+        // 배율은 로그로 보간하고, 화면 이동은 배율에 맞춰 따라가게 해서 기준점이 흔들리지 않게
+        const z = from.zoom * (to.zoom / from.zoom) ** e;
+        const k = Math.abs(to.zoom - from.zoom) > 1e-6 ? (z - from.zoom) / (to.zoom - from.zoom) : e;
+        const v = {
+          zoom: z,
+          pan: { x: from.pan.x + (to.pan.x - from.pan.x) * k, y: from.pan.y + (to.pan.y - from.pan.y) * k },
+        };
+        L.current.view = v;
+        setViewRaw(v);
+        if (t < 1) anim.current = { raf: requestAnimationFrame(step), to };
+        else anim.current = null;
+      };
+      anim.current = { raf: requestAnimationFrame(step), to };
+    },
+    [],
+  );
+  const zoomAt = useCallback(
+    (f: number, sx?: number, sy?: number) => {
+      // 애니메이션 중이면 도착점을 기준으로 이어서 계산 (휠을 연달아 굴려도 자연스럽게)
+      const v = anim.current?.to ?? L.current.view;
       const z = clamp(v.zoom * f, MIN_ZOOM, MAX_ZOOM);
       const r = z / v.zoom;
       const { w, h } = L.current.vp;
       const qx = (sx ?? w / 2) - w / 2;
       const qy = (sy ?? h / 2) - h / 2;
-      return { zoom: z, pan: { x: qx - (qx - v.pan.x) * r, y: qy - (qy - v.pan.y) * r } };
-    });
-  }, []);
-  const resetView = useCallback(() => setView({ zoom: 1, pan: { x: 0, y: 0 } }), []);
-  const panBy = useCallback((dx: number, dy: number) => setView((v) => ({ ...v, pan: { x: v.pan.x + dx, y: v.pan.y + dy } })), []);
+      animateTo({ zoom: z, pan: { x: qx - (qx - v.pan.x) * r, y: qy - (qy - v.pan.y) * r } });
+    },
+    [animateTo],
+  );
+  const resetView = useCallback(() => animateTo({ zoom: 1, pan: { x: 0, y: 0 } }), [animateTo]);
+  const panBy = useCallback((dx: number, dy: number) => setView((v) => ({ ...v, pan: { x: v.pan.x + dx, y: v.pan.y + dy } })), [setView]);
   const rotate = useCallback((dir: 1 | -1) => {
     // 반전 상태에서는 회전 방향이 뒤집히므로 보정
     setRot((r) => (r + (L.current.mirror ? -dir : dir) + 4) % 4);
     setView((v) => ({ ...v, pan: dir === 1 ? { x: -v.pan.y, y: v.pan.x } : { x: v.pan.y, y: -v.pan.x } }));
-  }, []);
+  }, [setView]);
   const toggleMirror = useCallback(() => {
     setMirror((x) => !x);
     setView((v) => ({ ...v, pan: { x: -v.pan.x, y: v.pan.y } }));
-  }, []);
+  }, [setView]);
   const toggleFreeze = useCallback(() => {
     const v = videoRef.current;
     if (!v || !streamRef.current) return;
@@ -483,6 +545,32 @@ export default function DeskCam() {
     notify(`카메라: ${next.label || "카메라"}`);
     selectCam(next.deviceId);
   }, [notify, selectCam]);
+  const doRefocus = useCallback(() => {
+    const track = streamRef.current?.getVideoTracks()[0];
+    const caps = track && getFocusCaps(track);
+    if (!track || !caps || (!caps.auto && !caps.once)) return notify("이 카메라는 웹에서 초점을 맞출 수 없어요");
+    refocus(track, caps)
+      .then(() => {
+        setFocusAuto(true);
+        notify("초점을 다시 맞췄어요");
+      })
+      .catch(() => notify("초점을 맞추지 못했어요"));
+  }, [notify]);
+  const changeFocusAuto = useCallback(
+    (on: boolean) => {
+      const track = streamRef.current?.getVideoTracks()[0];
+      if (!track) return;
+      const p = on ? setAutoFocus(track) : setFocusDistance(track, L.current.focusDist);
+      p.then(() => setFocusAuto(on)).catch(() => notify("초점 설정을 바꾸지 못했어요"));
+    },
+    [notify],
+  );
+  const changeFocusDist = useCallback((d: number) => {
+    setFocusDist(d);
+    setFocusAuto(false);
+    const track = streamRef.current?.getVideoTracks()[0];
+    if (track) setFocusDistance(track, d).catch(() => {});
+  }, []);
   const changeBright = useCallback((d: number) => {
     const b = Math.round(clamp(L.current.bright + d, 0.3, 2) * 10) / 10;
     setBright(b);
@@ -696,13 +784,13 @@ export default function DeskCam() {
 
   // ---- 단축키 ----
   const actions = useRef({
-    toggleFreeze, toggleFullscreen, rotate, toggleMirror, nextCam, zoomAt, resetView, panBy, changeBright, capture,
+    toggleFreeze, toggleFullscreen, rotate, toggleMirror, nextCam, doRefocus, zoomAt, resetView, panBy, changeBright, capture,
     copyView, saveLast, undo, redo, clearAnno, pickTool, moveViewing, deleteViewing, downloadCapture, copyCapture,
     recorder, downloadRecording, removeRecording,
   });
   useLayoutEffect(() => {
     actions.current = {
-      toggleFreeze, toggleFullscreen, rotate, toggleMirror, nextCam, zoomAt, resetView, panBy, changeBright, capture,
+      toggleFreeze, toggleFullscreen, rotate, toggleMirror, nextCam, doRefocus, zoomAt, resetView, panBy, changeBright, capture,
       copyView, saveLast, undo, redo, clearAnno, pickTool, moveViewing, deleteViewing, downloadCapture, copyCapture,
     recorder, downloadRecording, removeRecording,
     };
@@ -762,6 +850,7 @@ export default function DeskCam() {
         case "KeyR": a.rotate(e.shiftKey ? -1 : 1); break;
         case "KeyM": a.toggleMirror(); break;
         case "KeyN": a.nextCam(); break;
+        case "KeyA": a.doRefocus(); break;
         case "Equal": case "NumpadAdd": a.zoomAt(1.25); break;
         case "Minus": case "NumpadSubtract": a.zoomAt(0.8); break;
         case "Digit0": case "Numpad0": a.resetView(); break;
@@ -815,7 +904,7 @@ export default function DeskCam() {
       const r = el.getBoundingClientRect();
       const dy = e.deltaY * (e.deltaMode === 1 ? 16 : 1);
       // 트랙패드 핀치(ctrlKey)는 더 민감하게
-      zoomAt(Math.exp(-dy * (e.ctrlKey ? 0.01 : 0.0015)), e.clientX - r.left, e.clientY - r.top);
+      zoomAt(Math.exp(-dy * (e.ctrlKey ? 0.008 : 0.001)), e.clientX - r.left, e.clientY - r.top);
     };
     el.addEventListener("wheel", onWheel, { passive: false });
     return () => el.removeEventListener("wheel", onWheel);
@@ -1280,6 +1369,40 @@ export default function DeskCam() {
                   </select>
                   {trackInfo && <div className="mt-1 text-xs text-white/40">지금: {trackInfo}</div>}
                 </label>
+                {focusCaps && (
+                  <div className="mb-3">
+                    <div className="mb-1 flex items-center justify-between text-white/60">
+                      <span>초점</span>
+                      {focusCaps.auto && (
+                        <label className="flex cursor-pointer items-center gap-1.5 text-white/80">
+                          <input type="checkbox" checked={focusAuto} onChange={(e) => changeFocusAuto(e.target.checked)} />
+                          자동
+                        </label>
+                      )}
+                    </div>
+                    {(focusCaps.auto || focusCaps.once) && (
+                      <button
+                        onClick={doRefocus}
+                        className="mb-2 w-full rounded-lg bg-white/10 py-1.5 hover:bg-white/15"
+                      >
+                        지금 초점 맞추기 <kbd className="ml-1 rounded bg-white/10 px-1 text-xs">A</kbd>
+                      </button>
+                    )}
+                    {focusCaps.range && (
+                      <input
+                        type="range"
+                        aria-label="수동 초점 (가까이 ↔ 멀리)"
+                        min={focusCaps.range.min}
+                        max={focusCaps.range.max}
+                        step={focusCaps.range.step}
+                        value={focusDist}
+                        onChange={(e) => changeFocusDist(Number(e.target.value))}
+                        onPointerUp={(e) => e.currentTarget.blur()}
+                        className={`w-full accent-sky-400 ${focusAuto ? "opacity-50" : ""}`}
+                      />
+                    )}
+                  </div>
+                )}
                 <Slider label="밝기" hint="[ ]" value={bright} onChange={setBright} />
                 <Slider label="대비" value={contrast} onChange={setContrast} />
                 <label className="mb-3 flex cursor-pointer items-center gap-2">
