@@ -40,10 +40,14 @@ import {
   openFirstWorking,
   rankCameras,
   getFocusCaps,
+  getSharpnessCap,
+  normalizeQuality,
   refocus,
   setAutoFocus,
   setFocusDistance,
+  setSharpness,
   type FocusCaps,
+  type RangeCap,
   scoreCamera,
   type Quality,
   type SavedCamera,
@@ -80,6 +84,14 @@ const MIN_ZOOM = 0.5;
 const MAX_ZOOM = 12;
 const LS_CAM = "deskcam.camera";
 const LS_QUALITY = "deskcam.quality";
+const LS_SHARPEN = "deskcam.sharpen";
+const LS_CAM_SHARP = "deskcam.camSharpness";
+
+// 화면 보정 선명하게: 가장자리 대비를 살짝 올리는 3×3 언샤프 필터 세기
+type Sharpen = "off" | "low" | "high";
+const SHARPEN_K: Record<Sharpen, number> = { off: 0, low: 0.3, high: 0.7 };
+const SHARPEN_LABEL: Record<Sharpen, string> = { off: "끄기", low: "약하게", high: "강하게" };
+const SHARPEN_ID = "deskcam-sharpen";
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
 
@@ -128,6 +140,18 @@ async function blobToPng(blob: Blob) {
   c.getContext("2d")!.drawImage(bmp, 0, 0);
   return canvasToBlob(c, "image/png");
 }
+function hasGpu() {
+  try {
+    const gl = document.createElement("canvas").getContext("webgl");
+    if (!gl) return false;
+    const ext = gl.getExtension("WEBGL_debug_renderer_info");
+    const r = ext ? String(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL)) : "";
+    gl.getExtension("WEBGL_lose_context")?.loseContext();
+    return !/swiftshader|llvmpipe|software|basic render/i.test(r);
+  } catch {
+    return false;
+  }
+}
 function newId() {
   return typeof crypto !== "undefined" && "randomUUID" in crypto
     ? crypto.randomUUID()
@@ -148,7 +172,15 @@ export default function DeskCam() {
   const [camId, setCamId] = useState("");
   const [status, setStatus] = useState<"connecting" | "live" | "error">("connecting");
   const [error, setError] = useState("");
-  const [quality, setQuality] = useState<Quality>(() => (lsGet(LS_QUALITY) as Quality) || "1080");
+  const [quality, setQuality] = useState<Quality>(() => normalizeQuality(lsGet(LS_QUALITY)));
+  const [sharpen, setSharpen] = useState<Sharpen>(() => {
+    const s = lsGet(LS_SHARPEN);
+    if (s === "off" || s === "low" || s === "high") return s;
+    // 그래픽 가속이 없는 컴퓨터에서는 4K 영상에 필터를 걸면 화면이 멈출 수 있어 기본은 끈다
+    return hasGpu() ? "low" : "off";
+  });
+  const [sharpCap, setSharpCap] = useState<RangeCap | null>(null);
+  const [camSharp, setCamSharp] = useState(0);
   const [vsize, setVsize] = useState({ w: 1920, h: 1080 });
   const [vp, setVp] = useState({ w: 0, h: 0 });
   const [view, setViewRaw] = useState<View>({ zoom: 1, pan: { x: 0, y: 0 } });
@@ -198,7 +230,16 @@ export default function DeskCam() {
   const S = fit * view.zoom;
   const angle = (rot * Math.PI) / 2;
   const m = mirror ? -1 : 1;
-  const filterCss = `brightness(${bright}) contrast(${contrast})`;
+  // 보정이 없으면 none으로 둬야 브라우저가 영상을 거치는 단계 없이 그대로 그린다
+  const filterCss =
+    [
+      sharpen !== "off" && `url(#${SHARPEN_ID})`,
+      bright !== 1 && `brightness(${bright})`,
+      contrast !== 1 && `contrast(${contrast})`,
+    ]
+      .filter(Boolean)
+      .join(" ") || "none";
+  const sk = SHARPEN_K[sharpen];
   const stageTransform = `translate(${vp.w / 2 + view.pan.x}px, ${vp.h / 2 + view.pan.y}px) scale(${m}, 1) rotate(${
     rot * 90
   }deg) scale(${S}) translate(${-vsize.w / 2}px, ${-vsize.h / 2}px)`;
@@ -234,9 +275,18 @@ export default function DeskCam() {
     setTrackInfo(st.width ? `${st.width}×${st.height}${st.frameRate ? ` · ${Math.round(st.frameRate)}fps` : ""}` : "");
     const fc = getFocusCaps(track);
     setFocusCaps(fc);
-    const fs = st as MediaTrackSettings & { focusMode?: string; focusDistance?: number };
+    const fs = st as MediaTrackSettings & { focusMode?: string; focusDistance?: number; sharpness?: number };
     setFocusAuto(false);
     setFocusDist(fs.focusDistance ?? fc?.range?.min ?? 0);
+    // 카메라 자체 선명도: 전에 바꿔 둔 값이 있으면 다시 넣는다
+    const sc = getSharpnessCap(track);
+    setSharpCap(sc);
+    if (track && sc) {
+      const saved = lsGet(LS_CAM_SHARP);
+      const v = saved !== null ? clamp(Number(saved), sc.min, sc.max) : (fs.sharpness ?? sc.min);
+      setCamSharp(v);
+      if (saved !== null && v !== fs.sharpness) setSharpness(track, v).catch(() => {});
+    }
     // 켜자마자 초점을 한 번 맞추고 고정
     if (track && fc && (fc.auto || fc.once)) {
       refocus(track, fc)
@@ -585,6 +635,12 @@ export default function DeskCam() {
     setFocusAuto(false);
     const track = streamRef.current?.getVideoTracks()[0];
     if (track) setFocusDistance(track, d).catch(() => {});
+  }, []);
+  const changeCamSharp = useCallback((v: number) => {
+    setCamSharp(v);
+    lsSet(LS_CAM_SHARP, String(v));
+    const track = streamRef.current?.getVideoTracks()[0];
+    if (track) setSharpness(track, v).catch(() => {});
   }, []);
   const changeBright = useCallback((d: number) => {
     const b = Math.round(clamp(L.current.bright + d, 0.3, 2) * 10) / 10;
@@ -1070,6 +1126,17 @@ export default function DeskCam() {
       onPointerMove={wake}
       onPointerDown={wake}
     >
+      {/* 선명하게: 영상 화면·캡처·녹화가 모두 이 필터를 같이 쓴다 */}
+      <svg width="0" height="0" className="absolute" aria-hidden>
+        <filter id={SHARPEN_ID} colorInterpolationFilters="sRGB">
+          <feConvolveMatrix
+            order="3"
+            kernelMatrix={`0 ${-sk} 0 ${-sk} ${1 + 4 * sk} ${-sk} 0 ${-sk} 0`}
+            edgeMode="duplicate"
+            preserveAlpha="true"
+          />
+        </filter>
+      </svg>
       <div
         ref={viewportRef}
         className="relative flex-1 touch-none overflow-hidden"
@@ -1384,6 +1451,42 @@ export default function DeskCam() {
                   </select>
                   {trackInfo && <div className="mt-1 text-xs text-white/40">지금: {trackInfo}</div>}
                 </label>
+                <div className="mb-3">
+                  <div className="mb-1 text-white/60">선명하게 (화면 보정)</div>
+                  <div className="grid grid-cols-3 gap-1 rounded-lg bg-white/5 p-0.5">
+                    {(Object.keys(SHARPEN_LABEL) as Sharpen[]).map((s) => (
+                      <button
+                        key={s}
+                        onClick={() => {
+                          setSharpen(s);
+                          lsSet(LS_SHARPEN, s);
+                        }}
+                        className={`rounded-md py-1 ${sharpen === s ? "bg-white/15 font-bold" : "text-white/60 hover:text-white"}`}
+                      >
+                        {SHARPEN_LABEL[s]}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="mt-1 text-xs text-white/40">화면이 끊기거나 멈추면 꺼 주세요</div>
+                </div>
+                {sharpCap && (
+                  <label className="mb-3 block">
+                    <div className="mb-1 flex justify-between text-white/60">
+                      <span>카메라 선명도 (카메라 자체 설정)</span>
+                      <span className="tabular-nums">{camSharp}</span>
+                    </div>
+                    <input
+                      type="range"
+                      min={sharpCap.min}
+                      max={sharpCap.max}
+                      step={sharpCap.step}
+                      value={camSharp}
+                      onChange={(e) => changeCamSharp(Number(e.target.value))}
+                      onPointerUp={(e) => e.currentTarget.blur()}
+                      className="w-full accent-sky-400"
+                    />
+                  </label>
+                )}
                 {focusCaps && (
                   <div className="mb-3">
                     <div className="mb-1 flex items-center justify-between text-white/60">

@@ -1,8 +1,17 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Camera, Circle, Monitor, Pause, Play, Square, X } from "lucide-react";
-import { canRecordScreen, pickMime, startRecording, type RecOptions, type RecSession, type RecSource } from "@/lib/recorder";
+import { AppWindow, Camera, Circle, Eye, EyeOff, Globe, Monitor, Pause, Play, Square, X } from "lucide-react";
+import {
+  canRecordScreen,
+  markThisTab,
+  pickMime,
+  startRecording,
+  type RecOptions,
+  type RecSession,
+  type RecSource,
+  type Target,
+} from "@/lib/recorder";
 
 const LS_MIC = "deskcam.mic";
 const LS_SYS = "deskcam.systemAudio";
@@ -46,7 +55,10 @@ export function useRecorder({
     return { source: "camera", micId: mic === "none" ? null : (mic ?? ""), systemAudio: lsGet(LS_SYS) !== "0" };
   });
   const [mics, setMics] = useState<MediaDeviceInfo[]>([]);
-  const [rec, setRec] = useState<{ source: RecSource; paused: boolean; hasAudio: boolean } | null>(null);
+  const [rec, setRec] = useState<{ source: RecSource; paused: boolean; hasAudio: boolean; preview: MediaStream } | null>(
+    null,
+  );
+  const [target, setTarget] = useState<Target>({ self: false });
   const [elapsed, setElapsed] = useState(0);
   const [level, setLevel] = useState(0);
   const session = useRef<RecSession | null>(null);
@@ -71,11 +83,27 @@ export function useRecorder({
     const id = setInterval(() => {
       setElapsed(elapsedNow());
       setLevel(session.current?.level() ?? 0);
+      const t = session.current?.target();
+      if (t) setTarget((p) => (p.surface === t.surface && p.self === t.self ? p : t));
     }, 150);
     return () => clearInterval(id);
   }, [rec]);
 
-  useEffect(() => () => session.current?.stop(), []);
+  // 다른 탭에 있어도 녹화 중인 걸 알 수 있게 탭 제목에도 표시
+  const recording = !!rec;
+  useEffect(() => {
+    if (!recording) return;
+    const title = document.title;
+    document.title = `🔴 녹화 중 · ${title}`;
+    return () => {
+      document.title = title;
+    };
+  }, [recording]);
+
+  useEffect(() => {
+    markThisTab();
+    return () => session.current?.stop();
+  }, []);
 
   const start = useCallback(async () => {
     if (busy.current || session.current) return;
@@ -103,8 +131,10 @@ export function useRecorder({
       session.current = s;
       timing.current = { startedAt: Date.now(), pausedTotal: 0, pausedAt: 0 };
       setElapsed(0);
-      setRec({ source: opts.source, paused: false, hasAudio: s.hasAudio });
-      notify(`${opts.source === "camera" ? "실물화상기 화면" : "컴퓨터 화면"} 녹화를 시작했어요 · O로 끝내기`);
+      const t = s.target();
+      setTarget(t);
+      setRec({ source: opts.source, paused: false, hasAudio: s.hasAudio, preview: s.preview });
+      notify(`${targetLabel(opts.source, t)} 녹화를 시작했어요 · O로 끝내기`);
     } catch (err) {
       const name = err instanceof DOMException ? err.name : "";
       notify(name === "NotAllowedError" ? "녹화를 취소했어요" : "녹화를 시작하지 못했어요");
@@ -133,7 +163,37 @@ export function useRecorder({
     });
   }, []);
 
-  return { panelOpen, setPanelOpen, opts, setOpts, mics, rec, elapsed, level, start, stop, togglePause };
+  return { panelOpen, setPanelOpen, opts, setOpts, mics, rec, target, elapsed, level, start, stop, togglePause };
+}
+
+function targetLabel(source: RecSource, t: Target) {
+  if (source === "camera") return "실물화상기 화면";
+  if (t.self) return "이 탭(실물화상기)";
+  if (t.surface === "monitor") return "컴퓨터 전체 화면";
+  if (t.surface === "window") return "프로그램 창";
+  if (t.surface === "browser") return "인터넷 탭";
+  return "컴퓨터 화면";
+}
+
+function TargetIcon({ source, t }: { source: RecSource; t: Target }) {
+  if (source === "camera" || t.self) return <Camera size={16} />;
+  if (t.surface === "window") return <AppWindow size={16} />;
+  if (t.surface === "browser") return <Globe size={16} />;
+  return <Monitor size={16} />;
+}
+
+function StreamPreview({ stream }: { stream: MediaStream }) {
+  const ref = useRef<HTMLVideoElement>(null);
+  useEffect(() => {
+    const v = ref.current;
+    if (!v) return;
+    v.srcObject = stream;
+    v.play().catch(() => {});
+    return () => {
+      v.srcObject = null;
+    };
+  }, [stream]);
+  return <video ref={ref} muted playsInline className="h-full w-full object-contain" />;
 }
 
 export type RecorderApi = ReturnType<typeof useRecorder>;
@@ -264,38 +324,65 @@ function SourceCard({
 }
 
 export function RecordBadge({ r }: { r: RecorderApi }) {
+  const [showPreview, setShowPreview] = useState(true);
   if (!r.rec) return null;
-  const { paused, hasAudio, source } = r.rec;
+  const { paused, hasAudio, source, preview } = r.rec;
+  // 이 탭을 녹화할 때 미리보기를 띄우면 화면 속에 화면이 끝없이 비친다
+  const canPreview = source === "screen" && !r.target.self;
   return (
     <div
-      className="absolute right-4 top-4 z-30 flex items-center gap-2 rounded-full bg-black/80 py-1.5 pl-3 pr-1.5 shadow-lg ring-1 ring-red-500/60"
+      className="absolute right-4 top-4 z-30 flex w-72 flex-col overflow-hidden rounded-2xl bg-black/85 shadow-lg ring-1 ring-red-500/60"
       onPointerDown={(e) => e.stopPropagation()}
     >
-      <span className={`h-2.5 w-2.5 rounded-full bg-red-500 ${paused ? "" : "animate-pulse"}`} />
-      <span className="text-sm font-semibold tabular-nums">
-        {paused ? "일시정지" : source === "camera" ? "녹화" : "화면 녹화"} {formatDuration(r.elapsed)}
-      </span>
-      {hasAudio && (
-        <span className="h-1.5 w-12 overflow-hidden rounded-full bg-white/15" title="소리 크기">
-          <span className="block h-full bg-green-400 transition-[width]" style={{ width: `${Math.round(r.level * 100)}%` }} />
+      <div className="flex items-center gap-2 px-3 pt-2 text-sm">
+        <TargetIcon source={source} t={r.target} />
+        <span className="min-w-0 flex-1 truncate">
+          <span className="text-white/60">녹화 중인 화면 · </span>
+          <span className="font-bold">{targetLabel(source, r.target)}</span>
         </span>
+        {canPreview && (
+          <button
+            title={showPreview ? "미리보기 숨기기" : "미리보기 보기"}
+            onPointerDown={(e) => e.preventDefault()}
+            onClick={() => setShowPreview((s) => !s)}
+            className="text-white/60 hover:text-white"
+          >
+            {showPreview ? <EyeOff size={16} /> : <Eye size={16} />}
+          </button>
+        )}
+      </div>
+      {canPreview && showPreview && (
+        <div className="mx-3 mt-2 aspect-video overflow-hidden rounded-lg bg-neutral-900 ring-1 ring-white/10">
+          <StreamPreview stream={preview} />
+        </div>
       )}
-      <button
-        title={paused ? "이어서 녹화" : "일시정지"}
-        onPointerDown={(e) => e.preventDefault()}
-        onClick={r.togglePause}
-        className="grid h-8 w-8 place-items-center rounded-full hover:bg-white/15"
-      >
-        {paused ? <Play size={16} /> : <Pause size={16} />}
-      </button>
-      <button
-        title="녹화 끝내기 (O)"
-        onPointerDown={(e) => e.preventDefault()}
-        onClick={r.stop}
-        className="flex h-8 items-center gap-1 rounded-full bg-red-600 px-3 text-sm font-semibold hover:bg-red-500"
-      >
-        <Square size={12} fill="currentColor" /> 끝내기
-      </button>
+      <div className="flex items-center gap-2 py-1.5 pl-3 pr-1.5">
+        <span className={`h-2.5 w-2.5 rounded-full bg-red-500 ${paused ? "" : "animate-pulse"}`} />
+        <span className="flex-1 text-sm font-semibold tabular-nums">
+          {paused ? "일시정지" : "녹화"} {formatDuration(r.elapsed)}
+        </span>
+        {hasAudio && (
+          <span className="h-1.5 w-12 overflow-hidden rounded-full bg-white/15" title="소리 크기">
+            <span className="block h-full bg-green-400 transition-[width]" style={{ width: `${Math.round(r.level * 100)}%` }} />
+          </span>
+        )}
+        <button
+          title={paused ? "이어서 녹화" : "일시정지"}
+          onPointerDown={(e) => e.preventDefault()}
+          onClick={r.togglePause}
+          className="grid h-8 w-8 place-items-center rounded-full hover:bg-white/15"
+        >
+          {paused ? <Play size={16} /> : <Pause size={16} />}
+        </button>
+        <button
+          title="녹화 끝내기 (O)"
+          onPointerDown={(e) => e.preventDefault()}
+          onClick={r.stop}
+          className="flex h-8 items-center gap-1 rounded-full bg-red-600 px-3 text-sm font-semibold hover:bg-red-500"
+        >
+          <Square size={12} fill="currentColor" /> 끝내기
+        </button>
+      </div>
     </div>
   );
 }

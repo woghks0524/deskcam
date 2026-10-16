@@ -9,13 +9,37 @@ export type RecOptions = {
   systemAudio: boolean; // 컴퓨터 화면 녹화일 때만 의미 있음
 };
 
+// monitor = 전체 화면, window = 프로그램 창, browser = 브라우저 탭
+export type Surface = "monitor" | "window" | "browser";
+export type Target = { surface?: Surface; self: boolean }; // self = 바로 이 실물화상기 탭
+
 export type RecSession = {
   pause(): void;
   resume(): void;
   stop(): void;
   level(): number; // 0~1 소리 크기 (마이크 확인용)
+  target(): Target; // 녹화 중에 공유 창에서 다른 화면으로 바꿀 수 있어서 매번 읽는다
+  preview: MediaStream; // 녹화되는 화면 그대로 (미리보기용)
   hasAudio: boolean;
 };
+
+// 이 탭에 이름표를 달아 두면, 컴퓨터 화면 녹화에서 고른 탭이 바로 이 탭인지 알 수 있다 (크롬)
+const TAB_HANDLE = `deskcam-${Math.random().toString(36).slice(2)}`;
+export function markThisTab() {
+  const md = navigator.mediaDevices as MediaDevices & {
+    setCaptureHandleConfig?: (c: { handle: string; permittedOrigins: string[] }) => void;
+  };
+  try {
+    md?.setCaptureHandleConfig?.({ handle: TAB_HANDLE, permittedOrigins: [location.origin] });
+  } catch {}
+}
+
+function readTarget(track: MediaStreamTrack): Target {
+  const surface = (track.getSettings() as { displaySurface?: Surface }).displaySurface;
+  const handle = (track as MediaStreamTrack & { getCaptureHandle?: () => { handle?: string } | null })
+    .getCaptureHandle?.()?.handle;
+  return { surface, self: handle === TAB_HANDLE };
+}
 
 // avc3: 녹화 중 창 크기가 바뀌어도(컴퓨터 화면 녹화) 끊기지 않는 H.264 방식
 const MIME_CANDIDATES: [string, string][] = [
@@ -161,6 +185,8 @@ export async function startRecording(
         for (const v of buf) sum += ((v - 128) / 128) ** 2;
         return Math.min(1, Math.sqrt(sum / buf.length) * 4);
       },
+      target: () => (opts.source === "screen" ? readTarget(videoTrack) : { self: false }),
+      preview: new MediaStream([videoTrack]),
       hasAudio: !!audioTrack,
     };
   } catch (err) {

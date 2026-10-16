@@ -1,16 +1,20 @@
-export type Quality = "720" | "1080" | "4k";
+export type Quality = "max" | "1080" | "720";
 
+// max: 실물화상기는 센서가 500만~800만 화소(4:3)인 경우가 많은데, 1080p로 열면
+// 카메라가 줄여서 보내 확대할수록 흐려진다. 제조사 프로그램처럼 가장 큰 해상도로 연다.
 export const QUALITY_SIZE: Record<Quality, [number, number]> = {
-  "720": [1280, 720],
+  max: [4096, 3072],
   "1080": [1920, 1080],
-  "4k": [3840, 2160],
+  "720": [1280, 720],
 };
 
 export const QUALITY_LABEL: Record<Quality, string> = {
-  "720": "보통 (720p)",
-  "1080": "선명 (1080p)",
-  "4k": "최고 (4K)",
+  max: "최고 (카메라 최대 해상도)",
+  "1080": "보통 (1080p)",
+  "720": "가볍게 (720p)",
 };
+
+export const normalizeQuality = (q: string | null): Quality => (q === "1080" || q === "720" ? q : "max");
 
 // 노트북 내장 카메라는 실물화상기가 아니므로 뒤로 미룬다
 const BUILTIN = /facetime|integrated|built-?in|내장|front|rear|back camera|ir camera|user.?facing|hd webcam/i;
@@ -104,10 +108,25 @@ export async function refocus(track: MediaStreamTrack, caps: FocusCaps) {
   if (caps.once) return applyFocus(track, { focusMode: "single-shot" });
   await applyFocus(track, { focusMode: "manual" }).catch(() => {});
   await applyFocus(track, { focusMode: "continuous" });
-  await new Promise((r) => setTimeout(r, 1500));
+  await new Promise((r) => setTimeout(r, 2000));
   if (track.readyState !== "live") return;
-  // 거리 없이 manual로만 바꾸면 렌즈가 지금 위치에 멈춘다
-  return applyFocus(track, { focusMode: "manual" });
+  // 거리 없이 manual로만 바꾸면 카메라에 따라 예전에 저장된 거리로 돌아가 버린다.
+  // 자동이 찾은 거리를 읽어서 그 값으로 못 박는다.
+  const d = (track.getSettings() as { focusDistance?: number }).focusDistance;
+  return applyFocus(track, d !== undefined ? { focusMode: "manual", focusDistance: d } : { focusMode: "manual" });
+}
+
+// ---- 카메라 자체 선명도(샤프니스): 제조사 프로그램이 주로 올려 두는 값 ----
+export type RangeCap = { min: number; max: number; step: number };
+
+export function getSharpnessCap(track: MediaStreamTrack | undefined): RangeCap | null {
+  const s = (track?.getCapabilities?.() as { sharpness?: { min: number; max: number; step?: number } } | undefined)
+    ?.sharpness;
+  return s && s.max > s.min ? { min: s.min, max: s.max, step: s.step || 1 } : null;
+}
+
+export function setSharpness(track: MediaStreamTrack, v: number) {
+  return track.applyConstraints({ advanced: [{ sharpness: v } as MediaTrackConstraintSet] });
 }
 
 export function setFocusDistance(track: MediaStreamTrack, distance: number) {
@@ -126,7 +145,9 @@ export async function openCamera(deviceId: string | undefined, quality: Quality)
     ...base,
     width: { ideal: width },
     height: { ideal: height },
-    frameRate: { ideal: 30 },
+    // 최대 해상도는 15fps인 카메라가 많아서, 30fps를 원하면 브라우저가 1080p로 내려 버린다.
+    // 너무 끊기는 모드(10fps 미만)만 뺀다.
+    frameRate: quality === "max" ? { min: 10 } : { ideal: 30 },
   };
   const plain: MediaTrackConstraints | true = deviceId ? base : true;
   // 1) 원하는 해상도  2) 방금 끈 카메라가 아직 안 풀렸을 수 있어 잠깐 뒤 다시
