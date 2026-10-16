@@ -28,6 +28,7 @@ import {
   Type,
   Undo2,
   Video,
+  VideoOff,
   X,
   ZoomIn,
   ZoomOut,
@@ -170,7 +171,7 @@ export default function DeskCam() {
 
   const [cams, setCams] = useState<MediaDeviceInfo[]>([]);
   const [camId, setCamId] = useState("");
-  const [status, setStatus] = useState<"connecting" | "live" | "error">("connecting");
+  const [status, setStatus] = useState<"connecting" | "live" | "error" | "off">("connecting");
   const [error, setError] = useState("");
   const [quality, setQuality] = useState<Quality>(() => normalizeQuality(lsGet(LS_QUALITY)));
   const [sharpen, setSharpen] = useState<Sharpen>(() => {
@@ -248,13 +249,13 @@ export default function DeskCam() {
   const L = useRef({
     vp, vsize, view, S, angle, m, mirror, rot, tool, color, penSize, strokes: hist.cur, cams, camId, quality,
     frozen, captures, viewing, helpOpen, settingsOpen, galleryOpen, captureAnno, filterCss, bright, textDraft,
-    recordings, playing, focusDist,
+    recordings, playing, focusDist, status,
   });
   useLayoutEffect(() => {
     L.current = {
       vp, vsize, view, S, angle, m, mirror, rot, tool, color, penSize, strokes: hist.cur, cams, camId, quality,
       frozen, captures, viewing, helpOpen, settingsOpen, galleryOpen, captureAnno, filterCss, bright, textDraft,
-    recordings, playing, focusDist,
+    recordings, playing, focusDist, status,
     };
   });
 
@@ -366,6 +367,22 @@ export default function DeskCam() {
     [attach],
   );
 
+  // 카메라 끄기: 가리는 게 아니라 실제로 꺼서 카메라 불도 꺼지고 다른 프로그램도 쓸 수 있다
+  const turnOff = useCallback(() => {
+    seqRef.current++; // 연결 중이었다면 취소
+    connectingRef.current = false;
+    stopStream(streamRef.current);
+    streamRef.current = null;
+    const v = videoRef.current;
+    if (v) v.srcObject = null;
+    setFrozen(false);
+    setStatus("off");
+  }, []);
+  const toggleCamera = useCallback(() => {
+    if (L.current.status === "off") connect(L.current.camId || undefined);
+    else turnOff();
+  }, [connect, turnOff]);
+
   const selectCam = useCallback(
     (id: string) => {
       const c = L.current.cams.find((x) => x.deviceId === id);
@@ -412,6 +429,7 @@ export default function DeskCam() {
         const prev = L.current.cams;
         const list = await listCameras();
         setCams(list);
+        if (L.current.status === "off") return; // 일부러 꺼 둔 동안에는 다시 켜지 않는다
         const curTrack = streamRef.current?.getVideoTracks()[0];
         const alive = curTrack?.readyState === "live" && list.some((c) => c.deviceId === L.current.camId);
         if (!alive) {
@@ -857,13 +875,13 @@ export default function DeskCam() {
   const actions = useRef({
     toggleFreeze, toggleFullscreen, rotate, toggleMirror, nextCam, doRefocus, zoomAt, resetView, panBy, changeBright, capture,
     copyView, saveLast, undo, redo, clearAnno, pickTool, moveViewing, deleteViewing, downloadCapture, copyCapture,
-    recorder, downloadRecording, removeRecording,
+    recorder, downloadRecording, removeRecording, toggleCamera,
   });
   useLayoutEffect(() => {
     actions.current = {
       toggleFreeze, toggleFullscreen, rotate, toggleMirror, nextCam, doRefocus, zoomAt, resetView, panBy, changeBright, capture,
       copyView, saveLast, undo, redo, clearAnno, pickTool, moveViewing, deleteViewing, downloadCapture, copyCapture,
-    recorder, downloadRecording, removeRecording,
+    recorder, downloadRecording, removeRecording, toggleCamera,
     };
   });
 
@@ -921,6 +939,7 @@ export default function DeskCam() {
         case "KeyR": a.rotate(e.shiftKey ? -1 : 1); break;
         case "KeyM": a.toggleMirror(); break;
         case "KeyN": a.nextCam(); break;
+        case "KeyB": a.toggleCamera(); break;
         case "KeyA": a.doRefocus(); break;
         case "Equal": case "NumpadAdd": a.zoomAt(1.25); break;
         case "Minus": case "NumpadSubtract": a.zoomAt(0.8); break;
@@ -1103,7 +1122,8 @@ export default function DeskCam() {
     return () => clearTimeout(hideTimer.current);
   }, [scheduleHide]);
 
-  const showUi = uiVisible || status !== "live" || settingsOpen || helpOpen || recorder.panelOpen;
+  // 꺼 둔 화면은 수업 중 가림막으로 쓰므로 도구막대도 평소처럼 숨긴다
+  const showUi = uiVisible || (status !== "live" && status !== "off") || settingsOpen || helpOpen || recorder.panelOpen;
   const viewingIdx = captures.findIndex((c) => c.id === viewing);
   const viewingCap = viewingIdx >= 0 ? captures[viewingIdx] : null;
   const playingRec = recordings.find((r) => r.id === playing) ?? null;
@@ -1164,7 +1184,13 @@ export default function DeskCam() {
               e.currentTarget.videoWidth && setVsize({ w: e.currentTarget.videoWidth, h: e.currentTarget.videoHeight })
             }
           />
-          <canvas ref={annoRef} width={vsize.w} height={vsize.h} className="absolute inset-0 h-full w-full" />
+          <canvas
+            ref={annoRef}
+            width={vsize.w}
+            height={vsize.h}
+            className="absolute inset-0 h-full w-full"
+            style={{ visibility: status === "off" ? "hidden" : "visible" }}
+          />
         </div>
 
         {textDraft && (
@@ -1205,6 +1231,21 @@ export default function DeskCam() {
           <div className="absolute inset-0 grid place-items-center">
             <div className="flex items-center gap-3 text-lg text-white/80">
               <LoaderCircle className="animate-spin" /> 카메라 연결 중…
+            </div>
+          </div>
+        )}
+
+        {status === "off" && (
+          <div className="absolute inset-0 z-10 grid place-items-center" onPointerDown={(e) => e.stopPropagation()}>
+            <div className="flex flex-col items-center gap-4 text-white/40">
+              <VideoOff size={40} />
+              <span>카메라가 꺼져 있어요</span>
+              <button
+                onClick={toggleCamera}
+                className="flex items-center gap-2 rounded-xl bg-white/10 px-5 py-2.5 font-semibold text-white hover:bg-white/15"
+              >
+                <Video size={18} /> 카메라 켜기 <kbd className="rounded bg-white/10 px-1.5 text-xs">B</kbd>
+              </button>
             </div>
           </div>
         )}
@@ -1291,6 +1332,14 @@ export default function DeskCam() {
                 ))}
               </select>
             </label>
+            <Btn
+              label={status === "off" ? "카메라 켜기" : "카메라 끄기"}
+              keys="B"
+              active={status === "off"}
+              onClick={toggleCamera}
+            >
+              {status === "off" ? <Video size={20} /> : <VideoOff size={20} />}
+            </Btn>
 
             <Sep />
             <Btn label="이동" keys="V" active={tool === "move"} onClick={() => pickTool("move")}>
